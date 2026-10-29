@@ -6,13 +6,17 @@
  * gate globally, so the gate — not opencode — enforces the lock AND the context budget:
  *
  *  - REA's real MCP catalog is 207 tools (~2.6 MB ≈ 640k tokens). Injecting it raw
- *    would blow every thread's context. The gate therefore advertises exactly three
+ *    would blow every thread's context. The gate therefore advertises exactly five
  *    tiny meta-tools and drives the `rea` CLI underneath:
- *      rea_status  — lock state, REA version, readiness pointers (no lock needed)
- *      rea_catalog — discover the 207 backend tools by name/query (no lock needed)
- *      rea_cli     — run any `rea ...` CLI command, bounded output, full JSON to file
+ *      rea_status   — lock state, REA version, readiness pointers (no lock needed)
+ *      rea_catalog  — discover the 207 backend tools by name/query (no lock needed)
+ *      rea_cli      — run any `rea ...` CLI command, bounded output, full JSON to file
+ *      rea_mcp_call — call a backend MCP tool by name (full parity, same bounds)
+ *      rea_ghidra   — gated Ghidra headless passthrough (readiness verdict / run
+ *                     analyzeHeadless with the plugin-managed Ghidra + JDK env), for
+ *                     existing-project re-reads the REA CLI does not expose
  *
- *  - Locked (default): rea_cli/rea_catalog-analyzing calls get a clear refusal.
+ *  - Locked (default): rea_cli, rea_mcp_call and rea_ghidra run calls get a clear refusal.
  *  - Unlocked: session file ~/.open-bot/plugin-reverse-engineer-anything/session.json
  *    holds {"expires": <epochMs>} in the future; only the plugin CLI
  *    (ob-plugin-reverse-engineer-anything-mcp open|close) writes or removes it.
@@ -20,7 +24,7 @@
  * Degradation: if `rea` is missing, every call gets a clean error (never a crash).
  */
 import { createInterface } from "node:readline";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 
 const PLUGIN_ID = "reverse-engineer-anything";
 const HOME = process.env.HOME || "/home/agent";
@@ -103,7 +107,7 @@ const MISSING_MSG =
   `so its setup runs, then check \`${OPEN_CMD} status\`.`;
 
 // ---------------------------------------------------------------------------
-// The three meta-tools (tiny schemas on purpose — this is the whole context cost)
+// The five meta-tools (tiny schemas on purpose — this is the whole context cost)
 // ---------------------------------------------------------------------------
 const META_TOOLS = [
   {
@@ -160,6 +164,25 @@ const META_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "rea_ghidra",
+    description:
+      "Ghidra headless passthrough (analyzeHeadless with the plugin-managed Ghidra + JDK env) — for workflows the REA CLI does not expose, " +
+      "above all re-reading an EXISTING Ghidra project without re-analysis: args [PROJECT_DIR, PROJECT_NAME, '-process', PROGRAM, " +
+      "'-noanalysis', '-scriptPath', DIR, '-postScript', 'Script.java', ...script args]. " +
+      "mode 'readiness' returns a ghidra-only verdict (no session needed); mode 'run' executes analyzeHeadless and requires an open session " +
+      "(Reverse Engineer persona). One native analysis at a time; output beyond 256 KB is saved to a file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["readiness", "run"], description: "readiness: ghidra-only verdict, no lock. run: execute analyzeHeadless with args." },
+        args: { type: "array", items: { type: "string" }, description: "For mode run: analyzeHeadless arguments (project dir, project name, -process/-noanalysis/-postScript...)." },
+        timeout_minutes: { type: "number", description: "For mode run: cap for this run (default 15, max 60)." },
+      },
+      required: ["mode"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -212,6 +235,75 @@ function nativeEnv(): Record<string, string> {
   }
   return e;
 }
+// ---------------------------------------------------------------------------
+// Ghidra headless (rea_ghidra): resolution, ghidra-only readiness, single-flight.
+// REA 6.7.0 exposes no `ghidra` CLI subcommand, so existing-project re-reads
+// (-process -noanalysis -postScript) go through analyzeHeadless directly, with the
+// same plugin-managed env every gate child sees. Degradation: absent Ghidra/JDK is
+// a clean verdict, never a crash.
+// ---------------------------------------------------------------------------
+function ghidraDir(): string {
+  const s = String(settings().ghidra_install_dir ?? "").trim();
+  if (s) return s; // configured (even if missing — readiness surfaces the gap)
+  if (existsSync("/opt/ghidra/current/support/analyzeHeadless")) return "/opt/ghidra/current";
+  return "";
+}
+function javaHomeDir(): string {
+  const envHome = String(process.env.JAVA_HOME ?? "").trim();
+  if (envHome && existsSync(envHome)) return envHome;
+  if (existsSync("/opt/java/current")) return "/opt/java/current";
+  try {
+    const pick = readdirSync("/usr/lib/jvm")
+      .filter((d) => /java-2[1-9]-openjdk/.test(d))
+      .sort()
+      .pop();
+    if (pick) return `/usr/lib/jvm/${pick}`;
+  } catch { /* no jvm dir */ }
+  return "";
+}
+function javaOnPath(): boolean { return !!Bun.which("java"); }
+function ghidraReadiness() {
+  const dir = ghidraDir();
+  const headless = dir ? `${dir}/support/analyzeHeadless` : "";
+  const home = javaHomeDir();
+  const ready = !!dir && existsSync(headless) && ((!!home && existsSync(`${home}/bin/java`)) || javaOnPath());
+  return {
+    ready,
+    ghidra_dir: dir || null,
+    analyzeHeadless: dir && existsSync(headless) ? headless : null,
+    java_home: home || null,
+    java_on_path: javaOnPath(),
+  };
+}
+function ghidraRunEnv(): Record<string, string> {
+  const env: Record<string, string> = { ...childEnv(), ...extraEnv() };
+  const home = javaHomeDir();
+  if (home) { env.JAVA_HOME = home; env.PATH = `${home}/bin:${env.PATH || ""}`; }
+  return env;
+}
+const GHIDRA_LOCK = `${STATE_DIR}/ghidra.lock`;
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code !== "ESRCH"; }
+}
+function acquireGhidraLock(): { ok: boolean; holder: string } {
+  mkdirSync(STATE_DIR, { recursive: true });
+  try {
+    const { pid, at } = JSON.parse(readFileSync(GHIDRA_LOCK, "utf8"));
+    const stale = typeof pid !== "number" || !pidAlive(pid) || Date.now() - (at ?? 0) > 65 * 60_000;
+    if (!stale) return { ok: false, holder: `pid ${pid} since ${new Date(at ?? 0).toISOString()}` };
+    try { unlinkSync(GHIDRA_LOCK); } catch { /* raced */ }
+  } catch { /* no lock held */ }
+  try {
+    const fd = openSync(GHIDRA_LOCK, "wx");
+    writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+    closeSync(fd);
+    return { ok: true, holder: "" };
+  } catch {
+    return { ok: false, holder: "another ghidra run just started" };
+  }
+}
+function releaseGhidraLock() { try { unlinkSync(GHIDRA_LOCK); } catch { /* gone */ } }
+
 function reaVersion(): string | null {
   if (reaVersionCache !== undefined) return reaVersionCache;
   const p = reaPath();
@@ -295,22 +387,20 @@ async function catalog(): Promise<CatalogEntry[]> {
 }
 
 // ---------------------------------------------------------------------------
-// rea_cli runner (bounded output, full copy to file)
+// Bounded runner (rea_cli AND rea_ghidra): bounded inline output, full copy to file.
 // ---------------------------------------------------------------------------
 interface CliOutcome { exit_code: number | null; timed_out: boolean; duration_ms: number; output_path: string; truncated: boolean; stdout: string; stderr: string }
 
-async function runRea(args: string[], explicitTimeout?: unknown): Promise<CliOutcome> {
-  const p = reaPath();
-  if (!p) throw new Error("missing");
+async function runCapture(bin: string, args: string[], env: Record<string, string>, explicitTimeout: unknown, prefix: string): Promise<CliOutcome> {
   const cap = timeoutMinutes(explicitTimeout);
   const t0 = Date.now();
   mkdirSync(STATE_DIR, { recursive: true });
-  const outPath = `${STATE_DIR}/cli-${Date.now()}.json`;
-  const proc = Bun.spawn([p, ...args], {
+  const outPath = `${STATE_DIR}/${prefix}-${Date.now()}.json`;
+  const proc = Bun.spawn([bin, ...args], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...childEnv(), ...nativeEnv(), ...extraEnv() },
+    env,
   });
   let out = "";
   let err = "";
@@ -345,9 +435,21 @@ async function runRea(args: string[], explicitTimeout?: unknown): Promise<CliOut
   return { exit_code, timed_out, duration_ms, output_path: outPath, truncated, stdout, stderr };
 }
 
-function pruneOldCliOutputs() {
+async function runRea(args: string[], explicitTimeout?: unknown): Promise<CliOutcome> {
+  const p = reaPath();
+  if (!p) throw new Error("missing");
+  return runCapture(p, args, { ...childEnv(), ...nativeEnv(), ...extraEnv() }, explicitTimeout, "cli");
+}
+
+async function runGhidra(args: string[], explicitTimeout?: unknown): Promise<CliOutcome> {
+  const headless = `${ghidraDir()}/support/analyzeHeadless`;
+  if (!existsSync(headless)) throw new Error("ghidra missing");
+  return runCapture(headless, args, ghidraRunEnv(), explicitTimeout, "ghidra");
+}
+
+function pruneOldCliOutputs(pattern: string) {
   try {
-    const files = Array.from(new Bun.Glob("cli-*.json").scanSync({ cwd: STATE_DIR }));
+    const files = Array.from(new Bun.Glob(pattern).scanSync({ cwd: STATE_DIR }));
     if (files.length <= 20) return;
     for (const f of files.slice(0, files.length - 20)) {
       try { require("node:fs").unlinkSync(`${STATE_DIR}/${f}`); } catch { /* raced */ }
@@ -486,7 +588,7 @@ async function handleStatus(): Promise<object> {
         rea_version_pin: String(settings().rea_version ?? PIN_FALLBACK),
         timeout_minutes_default: timeoutMinutes(),
         hint: ver
-          ? "Use rea_catalog to discover commands, rea_cli to run them (session required), rea_mcp_call for backend tools. Native engine verdict above is authoritative. NEVER run `rea doctor` in a bare shell (env not injected) and NEVER judge native readiness from audit-wide doctor healthy:false — optional engines (hopper/ida/jadx/kuna) are expected missing. Scoped check only: rea_cli ['doctor','--provider','ghidra','--json']."
+          ? "Use rea_catalog to discover commands, rea_cli to run them (session required), rea_mcp_call for backend tools. Native engine verdict above is authoritative. NEVER run `rea doctor` in a bare shell (env not injected) and NEVER judge native readiness from audit-wide doctor healthy:false — optional engines (hopper/ida/jadx/kuna) are expected missing. Scoped check only: rea_cli ['doctor','--provider','ghidra','--json']. Ghidra headless re-reads of an existing project (-process -noanalysis -postScript) go through rea_ghidra (the REA CLI has no ghidra subcommand); rea_ghidra mode 'readiness' is the ghidra-only verdict scripts can rely on."
           : "Reinstall the plugin so its setup installs rea-agents, then re-check.",
       }, null, 2),
     }],
@@ -521,6 +623,23 @@ function validateArgs(args: unknown): string[] | null {
   return out;
 }
 
+// analyzeHeadless lines carry project dir + name + flags + script args: a wider cap than rea_cli.
+function validateGhidraArgs(args: unknown): string[] | null {
+  if (!Array.isArray(args) || args.length === 0 || args.length > 48) return null;
+  const out: string[] = [];
+  for (const a of args) {
+    if (typeof a !== "string" || a.length === 0 || a.length > 500) return null;
+    out.push(a);
+  }
+  return out;
+}
+
+const GHIDRA_POINTER =
+  "REA 6.7.0 has no `ghidra` subcommand (that path existed only in an older log). " +
+  "For Ghidra headless re-reads of an existing project use the rea_ghidra tool " +
+  "(mode 'run' with args [PROJECT_DIR, PROJECT_NAME, '-process', PROGRAM, '-noanalysis', '-scriptPath', DIR, '-postScript', 'Script.java', ...]), " +
+  "or the ob-plugin-reverse-engineer-anything-ghidra CLI in a shell.";
+
 // ---------------------------------------------------------------------------
 // Client loop
 // ---------------------------------------------------------------------------
@@ -537,12 +656,13 @@ rl.on("line", (line) => {
     result(id, {
       protocolVersion: params?.protocolVersion || "2025-03-26",
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: "rea-gate", version: "0.2.0" },
+      serverInfo: { name: "rea-gate", version: "0.3.0" },
       instructions:
         "REA (Reverse Engineer Anything) behind the reverse-engineer-anything gate. REA's full catalog is 200+ tools, " +
-        "far too large to inject, so this server exposes four meta-tools: rea_status (readiness), rea_catalog " +
-        "(discover backend tools), rea_cli (run any REA CLI command), rea_mcp_call (call a backend MCP tool by name). " +
-        "Locked by default: rea_cli and rea_mcp_call unlock only for the " +
+        "far too large to inject, so this server exposes five meta-tools: rea_status (readiness), rea_catalog " +
+        "(discover backend tools), rea_cli (run any REA CLI command), rea_mcp_call (call a backend MCP tool by name), " +
+        "rea_ghidra (gated Ghidra headless passthrough: readiness verdict or run analyzeHeadless on an existing project). " +
+        "Locked by default: rea_cli, rea_mcp_call and rea_ghidra run unlock only for the " +
         "Reverse Engineer persona via ob-plugin-reverse-engineer-anything-mcp open, and re-locks on close or TTL expiry. " +
         "One native analysis at a time. Analyze only software you own or are authorized to examine.",
     });
@@ -575,11 +695,12 @@ rl.on("line", (line) => {
       }
       const args = validateArgs(params?.arguments?.args);
       if (!args) { errResult(id, "rea_cli: args must be a non-empty array of short strings (max 32 items)."); return; }
+      if (args[0] === "ghidra") { log(`refused rea_cli ghidra (pointer)`); errResult(id, GHIDRA_POINTER); return; }
       if (!reaPath()) { errResult(id, MISSING_MSG); return; }
       log(`rea_cli: ${args.join(" ")}`);
       runRea(args, params?.arguments?.timeout_minutes)
         .then((o) => {
-          pruneOldCliOutputs();
+          pruneOldCliOutputs("cli-*.json");
           const text =
             `exit_code=${o.exit_code}${o.timed_out ? " (TIMED OUT — partial output)" : ""} duration_ms=${o.duration_ms}\n` +
             (o.truncated ? `OUTPUT TRUNCATED — full copy at ${o.output_path}\n` : `full copy at ${o.output_path}\n`) +
@@ -613,13 +734,67 @@ rl.on("line", (line) => {
       });
       return;
     }
-    errResult(id, `Unknown tool ${name}. This gate exposes only rea_status, rea_catalog, rea_cli, rea_mcp_call.`);
+    if (name === "rea_ghidra") {
+      const mode = String(params?.arguments?.mode ?? "");
+      if (mode === "readiness") {
+        const r = ghidraReadiness();
+        result(id, { content: [{ type: "text", text: JSON.stringify({
+          ready: r.ready,
+          ghidra_dir: r.ghidra_dir,
+          analyzeHeadless: r.analyzeHeadless,
+          java_home: r.java_home,
+          java_on_path: r.java_on_path,
+          remediation: r.ready ? null :
+            "Set the plugin setting ghidra_install_dir (Plugins tab → reverse-engineer-anything → Settings) to a Ghidra install containing support/analyzeHeadless, and provide a JDK 21+ (JAVA_HOME or java on PATH). The plugin setup normally lays both down at /opt/ghidra and /opt/java.",
+        }, null, 2) }] });
+        return;
+      }
+      if (mode === "run") {
+        if (!isOpen()) {
+          const hadSession = !!readSession();
+          log(`refused rea_ghidra run (${hadSession ? "expired" : "locked"})`);
+          errResult(id, hadSession ? EXPIRED_MSG : LOCK_MSG);
+          return;
+        }
+        const args = validateGhidraArgs(params?.arguments?.args);
+        if (!args) { errResult(id, "rea_ghidra run: args must be a non-empty array of short strings (max 48 items), starting with the project directory and project name."); return; }
+        if (!ghidraReadiness().ready) {
+          errResult(id, "Ghidra is not ready (analyzeHeadless or JDK missing). Call rea_ghidra {mode:'readiness'} for the exact gap and remediation.");
+          return;
+        }
+        const lock = acquireGhidraLock();
+        if (!lock.ok) {
+          errResult(id, `Another Ghidra analysis is already running (${lock.holder}). One native analysis at a time — wait for it to finish.`);
+          return;
+        }
+        log(`rea_ghidra run: ${args.join(" ")}`);
+        runGhidra(args, params?.arguments?.timeout_minutes)
+          .then((o) => {
+            releaseGhidraLock();
+            pruneOldCliOutputs("ghidra-*.json");
+            const text =
+              `exit_code=${o.exit_code}${o.timed_out ? " (TIMED OUT — partial output)" : ""} duration_ms=${o.duration_ms}\n` +
+              (o.truncated ? `OUTPUT TRUNCATED — full copy at ${o.output_path}\n` : `full copy at ${o.output_path}\n`) +
+              `\n--- stdout ---\n${o.stdout || "(empty)"}\n` +
+              (o.stderr ? `\n--- stderr ---\n${o.stderr}` : "");
+            result(id, { content: [{ type: "text", text }] });
+          })
+          .catch((e) => {
+            releaseGhidraLock();
+            errResult(id, `rea_ghidra failed: ${e}. Call rea_ghidra {mode:'readiness'} to check the install.`);
+          });
+        return;
+      }
+      errResult(id, "rea_ghidra: mode must be 'readiness' or 'run'.");
+      return;
+    }
+    errResult(id, `Unknown tool ${name}. This gate exposes only rea_status, rea_catalog, rea_cli, rea_mcp_call, rea_ghidra.`);
     return;
   }
 
   if (method.startsWith("notifications/")) return; // nothing to forward; CLI runs are self-contained
   if (isNotification) return;
-  protoError(id, `rea-gate: ${method} is not supported; use tools rea_status, rea_catalog, rea_cli.`);
+  protoError(id, `rea-gate: ${method} is not supported; use tools rea_status, rea_catalog, rea_cli, rea_ghidra.`);
 });
 
 rl.on("close", () => { killMcpChild("client gone"); process.exit(0); });

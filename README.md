@@ -9,10 +9,19 @@ Powered by [REA (morluto/rea)](https://github.com/morluto/rea), MIT.
 REA's MCP server advertises 200+ tools (~2.6 MB of JSON). Injecting that into every
 thread would waste enormous context. This plugin registers a **gate** instead:
 
-- exactly **four tiny meta-tools** (`rea_status`, `rea_catalog`, `rea_cli`, `rea_mcp_call` — the last one reaches all 207 backend REA MCP tools by name) — a few
+- exactly **five tiny meta-tools** (`rea_status`, `rea_catalog`, `rea_cli`, `rea_mcp_call` — the last one reaches all 207 backend REA MCP tools by name — and `rea_ghidra`) — a few
   hundred tokens of context, in every thread;
 - the full REA power stays reachable through `rea_cli` (REA's CLI runs the same
   workflows as its MCP tools) and `rea_catalog` (discover the backend tools);
+- **Ghidra headless passthrough**: REA 6.7.0 has no `ghidra` CLI subcommand, so
+  `rea_ghidra` (MCP) and the `ob-plugin-reverse-engineer-anything-ghidra` shell CLI
+  re-read an **existing** Ghidra project without re-analysis
+  (`-process <prog> -noanalysis -scriptPath <dir> -postScript <Script.java> ...`)
+  with the plugin-managed Ghidra + JDK env, under the same session lock and a
+  one-native-analysis-at-a-time lock shared by both entry points. The shell CLI's
+  `readiness` subcommand prints a ghidra-only verdict and exits 0/1 (scripts can
+  test the code — `rea doctor` exits 1 whenever any optional engine is missing,
+  which is the normal state here);
 - **locked by default**: analysis calls are refused outside an open session, which
   only the **Reverse Engineer** persona opens (`ob-plugin-reverse-engineer-anything-mcp
   open|close|status`).
